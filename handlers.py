@@ -519,7 +519,7 @@ async def admin_master_times(message: Message, state: FSMContext):
 
 
 # --------------------------------------------------------------------------- #
-# Статистика БД (админ)
+# Статистика БД (админ).
 # --------------------------------------------------------------------------- #
 @router.message(lambda m: m.text == "📊 Статистика БД" and m.from_user.id in ADMIN_IDS)
 async def admin_show_stats(message: Message):

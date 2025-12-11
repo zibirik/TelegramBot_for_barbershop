@@ -58,7 +58,7 @@ LOGS_DIR: str = str(BASE_DIR / os.getenv("LOGS_DIR", "logs"))
 os.makedirs(REPORTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
-# Localization
+# Localization.
 TIMEZONE: str = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
 
 # Feature Flags
