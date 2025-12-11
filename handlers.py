@@ -519,6 +519,28 @@ async def admin_master_times(message: Message, state: FSMContext):
 
 
 # --------------------------------------------------------------------------- #
+# Статистика БД (админ)
+# --------------------------------------------------------------------------- #
+@router.message(lambda m: m.text == "📊 Статистика БД" and m.from_user.id in ADMIN_IDS)
+async def admin_show_stats(message: Message):
+    """Показывает статистику базы данных."""
+    from db import get_database_stats
+
+    stats = get_database_stats()
+
+    text = (
+        "📊 <b>Статистика базы данных</b>\n\n"
+        f"👥 Пользователей: {stats['users']}\n"
+        f"📅 Свободных слотов мастеров: {stats['masters_slots']}\n"
+        f"⏳ Активных записей: {stats['active_bookings']}\n"
+        f"✅ Завершённых записей: {stats['completed_bookings']}\n"
+        f"💬 Необработанных обращений: {stats['pending_support']}\n"
+    )
+
+    await message.answer(text, reply_markup=admin_menu_kb())
+
+
+# --------------------------------------------------------------------------- #
 #   Показ слотов мастеров
 # --------------------------------------------------------------------------- #
 @router.message(lambda m: m.text == "📊 Показать слоты мастеров" and m.from_user.id in ADMIN_IDS)
