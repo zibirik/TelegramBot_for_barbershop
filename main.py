@@ -1,4 +1,4 @@
-# main.py – Production-ready точка входа
+# main.py – Production-ready точка входа Barbershop Bot
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +39,7 @@ from keyboards import completion_kb
 
 
 # ============================================================================
-# Logging Setup.
+# Logging Setup
 # ============================================================================
 def setup_logging() -> logging.Logger:
     """Настраивает систему логирования."""
@@ -49,24 +49,27 @@ def setup_logging() -> logging.Logger:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
+    # Консольный хэндлер
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter(log_format, date_format))
 
+    # Файловый хэндлер с ротацией
     log_file = Path(LOGS_DIR) / "barbershop_bot.log"
     file_handler = RotatingFileHandler(
         log_file,
-        maxBytes=10 * 1024 * 1024,
+        maxBytes=10 * 1024 * 1024,  # 10MB
         backupCount=5,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(log_format, date_format))
 
+    # Хэндлер для ошибок
     error_file = Path(LOGS_DIR) / "errors.log"
     error_handler = RotatingFileHandler(
         error_file,
-        maxBytes=5 * 1024 * 1024,
+        maxBytes=5 * 1024 * 1024,  # 5MB
         backupCount=3,
         encoding="utf-8",
     )
@@ -77,6 +80,7 @@ def setup_logging() -> logging.Logger:
     root_logger.addHandler(file_handler)
     root_logger.addHandler(error_handler)
 
+    # Отключаем verbose логи aiogram
     logging.getLogger("aiogram").setLevel(logging.WARNING)
 
     return logging.getLogger(__name__)
@@ -117,10 +121,10 @@ async def run_reminder_cycle(bot: Bot) -> None:
 
             text = (
                 f"🔔 <b>Напоминание о записи через {hours} ч</b>\n\n"
-                f"✂️ Услуга: {b['haircut']} — {b['price']}₽\n"
-                f"📅 Дата: {date_str}\n"
-                f"🕐 Время: {time_str}\n"
-                f"👨‍🦰 Мастер: {b['master']}\n\n"
+                f"✂️ Услуга: <b>{b['haircut']}</b> — {b['price']}₽\n"
+                f"📅 Дата: <b>{date_str}</b>\n"
+                f"🕐 Время: <b>{time_str}</b>\n"
+                f"👨‍🦰 Мастер: <b>{b['master']}</b>\n\n"
                 f"Ждём вас! ❤️"
             )
 
@@ -132,7 +136,7 @@ async def run_reminder_cycle(bot: Bot) -> None:
                 if "chat not found" in str(exc).lower() or "user is deactivated" in str(exc).lower():
                     log.warning(f"⚠️ Пользователь {user_id} недоступен")
                 else:
-                    log.exception(f"❌ Ошибка отправки напоминания")
+                    log.exception(f"❌ Ошибка отправки напоминания пользователю {user_id}")
 
     # Напоминание за 30 минут
     target_30 = now_utc + timedelta(minutes=30)
@@ -154,10 +158,10 @@ async def run_reminder_cycle(bot: Bot) -> None:
 
         text = (
             f"🔔 <b>Напоминание! Через 30 минут</b>\n\n"
-            f"✂️ Услуга: {b['haircut']} — {b['price']}₽\n"
-            f"📅 Дата: {date_str}\n"
-            f"🕐 Время: {time_str}\n"
-            f"👨‍🦰 Мастер: {b['master']}\n\n"
+            f"✂️ Услуга: <b>{b['haircut']}</b> — {b['price']}₽\n"
+            f"📅 Дата: <b>{date_str}</b>\n"
+            f"🕐 Время: <b>{time_str}</b>\n"
+            f"👨‍🦰 Мастер: <b>{b['master']}</b>\n\n"
             f"⏰ Не опаздывайте!"
         )
 
@@ -208,7 +212,7 @@ async def cleanup_loop(bot: Bot) -> None:
                     if stats['expired_bookings'] > 0:
                         msg = (
                             f"⚠️ <b>Обнаружены неявки</b>\n\n"
-                            f"Удалено {stats['expired_bookings']} просроченных записей\n"
+                            f"Удалено <b>{stats['expired_bookings']}</b> просроченных записей\n"
                             f"(клиенты не пришли на запись)"
                         )
 
@@ -223,13 +227,13 @@ async def cleanup_loop(bot: Bot) -> None:
                 if now.weekday() == 0 and 3 <= now.hour < 4:
                     try:
                         vacuum_database()
-                        log.info("🧹 VACUUM выполнен")
+                        log.info("🧹 VACUUM выполнен успешно")
 
                         for admin_id in ADMIN_IDS:
                             try:
                                 await bot.send_message(
                                     admin_id,
-                                    "🧹 База данных оптимизирована (VACUUM)"
+                                    "🧹 <b>База данных оптимизирована</b>\n(выполнена процедура VACUUM)"
                                 )
                             except:
                                 pass
@@ -263,6 +267,7 @@ async def completion_loop(bot: Bot) -> None:
 
                 master_name = b["master"]
 
+                # Ищем telegram_id мастера
                 tg_id = None
                 for slot in get_all_master_slots():
                     if slot["name"] == master_name and slot.get("telegram_id"):
@@ -271,9 +276,10 @@ async def completion_loop(bot: Bot) -> None:
 
                 msg = (
                     f"⏰ <b>Запись #{bid} завершилась</b>\n\n"
-                    f"👨‍🦰 Мастер: {master_name}\n"
-                    f"✂️ Услуга: {b['haircut']} — {b['price']}₽\n"
-                    f"👤 Клиент: {b['full_name']}\n\n"
+                    f"👨‍🦰 Мастер: <b>{master_name}</b>\n"
+                    f"✂️ Услуга: <b>{b['haircut']}</b> — {b['price']}₽\n"
+                    f"👤 Клиент: <b>{b['full_name']}</b>\n"
+                    f"📱 Телефон: {b['phone']}\n\n"
                     f"Подтвердите выполнение:"
                 )
 
@@ -306,20 +312,26 @@ async def stats_reporter_loop(bot: Bot) -> None:
     """Отправляет статистику админам раз в день."""
     log.info("📊 Запуск цикла отправки статистики")
 
+    last_send_hour = -1
+
     while True:
         try:
             now = datetime.now()
 
-            if now.hour == 9 and now.minute < 5:
+            # Отправляем в 9:00 каждый день
+            if now.hour == 9 and last_send_hour != 9:
+                last_send_hour = 9
+
                 stats = get_database_stats()
 
                 msg = (
-                    f"📊 <b>Ежедневная статистика</b>\n\n"
-                    f"👥 Пользователей: {stats['users']}\n"
-                    f"📅 Свободных слотов: {stats['masters_slots']}\n"
-                    f"⏳ Активных записей: {stats['active_bookings']}\n"
-                    f"✅ Завершённых записей: {stats['completed_bookings']}\n"
-                    f"💬 Необработанных обращений: {stats['pending_support']}\n"
+                    f"📊 <b>Ежедневная статистика</b>\n"
+                    f"Дата: {now.strftime('%d.%m.%Y')}\n\n"
+                    f"👥 Пользователей: <b>{stats['users']}</b>\n"
+                    f"📅 Свободных слотов: <b>{stats['masters_slots']}</b>\n"
+                    f"⏳ Активных записей: <b>{stats['active_bookings']}</b>\n"
+                    f"✅ Завершённых записей: <b>{stats['completed_bookings']}</b>\n"
+                    f"💬 Необработанных обращений: <b>{stats['pending_support']}</b>"
                 )
 
                 for admin_id in ADMIN_IDS:
@@ -329,7 +341,11 @@ async def stats_reporter_loop(bot: Bot) -> None:
                         log.exception(f"❌ Не удалось отправить статистику → {admin_id}")
 
                 log.info("📊 Статистика отправлена админам")
-                await asyncio.sleep(3600)
+
+            # Сбрасываем флаг в полночь
+            if now.hour != 9:
+                last_send_hour = -1
+
         except Exception:
             log.exception("❌ Ошибка в stats_reporter_loop")
 
@@ -341,36 +357,51 @@ async def stats_reporter_loop(bot: Bot) -> None:
 # ============================================================================
 async def main() -> None:
     """Главная функция запуска бота."""
-    log.info("=" * 60)
+    log.info("=" * 70)
     log.info("🚀 Запуск Barbershop Bot...")
-    log.info("=" * 60)
+    log.info("=" * 70)
+
+    tasks = []
 
     try:
+        # Инициализация БД
         log.info("💾 Инициализация базы данных...")
         init_db()
         ensure_support_parent_column()
 
+        # Стартовая очистка
         log.info("🧹 Стартовая очистка просроченных слотов...")
         removed = remove_expired_master_slots()
         if removed:
             log.info(f"🧹 Удалено {removed} просроченных слотов")
 
+        # Статистика БД
         stats = get_database_stats()
-        log.info(f"📊 Статистика БД: {stats}")
+        log.info(
+            f"📊 Статистика БД: "
+            f"пользователей={stats['users']}, "
+            f"слотов={stats['masters_slots']}, "
+            f"активных={stats['active_bookings']}, "
+            f"завершённых={stats['completed_bookings']}"
+        )
 
+        # Создание бота
         log.info("🤖 Создание экземпляра бота...")
         bot = Bot(
             token=BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         )
 
+        # Проверка бота
         bot_info = await bot.get_me()
         log.info(f"✅ Бот запущен: @{bot_info.username} (ID: {bot_info.id})")
 
+        # Dispatcher
         storage = MemoryStorage()
         dp = Dispatcher(storage=storage)
         dp.include_router(router)
 
+        # Фоновые задачи
         log.info("⚙️ Запуск фоновых задач...")
         tasks = [
             asyncio.create_task(reminder_loop(bot), name="reminder_loop"),
@@ -379,24 +410,28 @@ async def main() -> None:
             asyncio.create_task(stats_reporter_loop(bot), name="stats_reporter"),
         ]
 
-        log.info("=" * 60)
+        log.info("=" * 70)
         log.info("✅ Все системы запущены. Бот работает!")
-        log.info("=" * 60)
+        log.info("=" * 70)
 
+        # Уведомляем админов о запуске
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
                     f"✅ <b>Бот успешно запущен!</b>\n\n"
                     f"🤖 @{bot_info.username}\n"
-                    f"📊 Статистика:\n"
-                    f"  • Пользователей: {stats['users']}\n"
-                    f"  • Активных записей: {stats['active_bookings']}\n"
-                    f"  • Свободных слотов: {stats['masters_slots']}"
+                    f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                    f"📊 <b>Статистика:</b>\n"
+                    f"  👥 Пользователей: {stats['users']}\n"
+                    f"  📅 Свободных слотов: {stats['masters_slots']}\n"
+                    f"  ⏳ Активных записей: {stats['active_bookings']}\n"
+                    f"  ✅ Завершённых записей: {stats['completed_bookings']}"
                 )
             except Exception:
                 log.exception(f"❌ Не удалось уведомить админа {admin_id}")
 
+        # Запуск polling
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     except KeyboardInterrupt:
@@ -407,20 +442,24 @@ async def main() -> None:
     finally:
         log.info("🛑 Остановка бота...")
 
+        # Останавливаем фоновые задачи
         for task in tasks:
-            task.cancel()
-            log.info(f"🛑 Остановка задачи: {task.get_name()}")
+            if not task.done():
+                task.cancel()
+                log.info(f"🛑 Остановка задачи: {task.get_name()}")
 
+        # Ждём завершения всех задач
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Закрываем сессию бота
         try:
             await bot.session.close()
         except:
             pass
 
-        log.info("=" * 60)
+        log.info("=" * 70)
         log.info("👋 Бот успешно остановлен. До встречи!")
-        log.info("=" * 60)
+        log.info("=" * 70)
 
 
 # ============================================================================
@@ -430,7 +469,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("\n👋 Бот остановлен пользователем")
     except Exception:
         log.exception("❌ Необработанная ошибка")
         sys.exit(1)

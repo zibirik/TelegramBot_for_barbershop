@@ -246,8 +246,8 @@ def update_master_schedule(
     try:
         sd = datetime.strptime(start_date, "%Y-%m-%d").date()
         ed = datetime.strptime(end_date, "%Y-%m-%d").date()
-        st = datetime.strptime(start_time, "%H:%M")
-        et = datetime.strptime(end_time, "%H:%M")
+        st = datetime.strptime(start_time, "%H:%M").time()
+        et = datetime.strptime(end_time, "%H:%M").time()
     except Exception as exc:
         raise ValueError("Invalid date/time format for master schedule") from exc
 
@@ -262,16 +262,22 @@ def update_master_schedule(
     cur_date = sd
 
     while cur_date <= ed:
-        cur_time = st
-        while cur_time < et:
+        # Начинаем с начального времени каждый день
+        cur_datetime = datetime.combine(cur_date, st)
+        end_datetime = datetime.combine(cur_date, et)
+
+        # Генерируем слоты для текущего дня
+        while cur_datetime < end_datetime:
             slots.append((
                 name,
                 telegram_id,
                 cur_date.strftime("%Y-%m-%d"),
-                cur_time.strftime("%H:%M"),
+                cur_datetime.time().strftime("%H:%M"),
             ))
-            cur_time = (datetime.combine(cur_date, cur_time.time()) + timedelta(minutes=step_minutes)).time()
-            cur_time = datetime.combine(cur_date, cur_time)
+            # Добавляем шаг
+            cur_datetime += timedelta(minutes=step_minutes)
+
+        # Переходим к следующему дню
         cur_date += timedelta(days=1)
 
     with get_conn() as conn:
@@ -963,7 +969,6 @@ def cleanup_all_expired_data() -> Dict[str, int]:
     stats['expired_slots'] = remove_expired_master_slots()
     stats['expired_bookings'] = remove_expired_bookings(grace_hours=2)
 
-    # Импортируем здесь, чтобы избежать циклических импортов
     try:
         from config import OLD_BOOKINGS_RETENTION_DAYS
         stats['old_completed'] = remove_old_completed_bookings(days=OLD_BOOKINGS_RETENTION_DAYS)
@@ -1014,8 +1019,40 @@ def vacuum_database() -> None:
         log.info("db: VACUUM выполнен успешно")
 
 
+def remove_master_slots(slot_ids: List[int]) -> int:
+    """Удаляет слоты по ID."""
+    if not slot_ids:
+        return 0
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in slot_ids)
+        cur.execute(f"DELETE FROM masters WHERE id IN ({placeholders})", slot_ids)
+        conn.commit()
+        deleted = cur.rowcount
+
+        if deleted > 0:
+            log.info(f"db: Удалено {deleted} слотов по ID")
+
+        return deleted
+
+
+def remove_master_slots_by_name(master_name: str) -> int:
+    """Удаляет все слоты мастера по имени."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM masters WHERE name = ?", (master_name,))
+        conn.commit()
+        deleted = cur.rowcount
+
+        if deleted > 0:
+            log.info(f"db: Удалено {deleted} слотов для мастера '{master_name}'")
+
+        return deleted
+
+
 # ============================================================================
-# Export.
+# Export
 # ============================================================================
 __all__ = [
     "init_db",
