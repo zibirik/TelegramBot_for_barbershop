@@ -1,4 +1,4 @@
-# main.py – Production-ready точка входа Barbershop Bot
+# main.py – Production-ready точка входа Barbershop Bot (v2-ready)
 from __future__ import annotations
 
 import asyncio
@@ -170,7 +170,7 @@ async def run_reminder_cycle(bot: Bot) -> None:
             mark_reminder_sent(b_id, 0.5)
             log.info(f"✅ Напоминание (30мин) отправлено для записи #{b_id}")
         except Exception:
-            log.exception(f"❌ Ошибка отправки напоминания за 30 мин")
+            log.exception("❌ Ошибка отправки напоминания за 30 мин")
 
 
 async def reminder_loop(bot: Bot) -> None:
@@ -209,7 +209,7 @@ async def cleanup_loop(bot: Bot) -> None:
                     )
 
                     # Уведомляем админов о неявках
-                    if stats['expired_bookings'] > 0:
+                    if stats["expired_bookings"] > 0:
                         msg = (
                             f"⚠️ <b>Обнаружены неявки</b>\n\n"
                             f"Удалено <b>{stats['expired_bookings']}</b> просроченных записей\n"
@@ -233,9 +233,10 @@ async def cleanup_loop(bot: Bot) -> None:
                             try:
                                 await bot.send_message(
                                     admin_id,
-                                    "🧹 <b>База данных оптимизирована</b>\n(выполнена процедура VACUUM)"
+                                    "🧹 <b>База данных оптимизирована</b>\n"
+                                    "(выполнена процедура VACUUM)",
                                 )
-                            except:
+                            except Exception:
                                 pass
                     except Exception:
                         log.exception("❌ Ошибка VACUUM")
@@ -249,10 +250,10 @@ async def cleanup_loop(bot: Bot) -> None:
 # Completion Check System
 # ============================================================================
 async def completion_loop(bot: Bot) -> None:
-    """Проверка завершения записей."""
+    """Проверка завершения записей и запрос подтверждения."""
     log.info(f"✅ Запуск цикла проверки завершения (интервал {COMPLETION_CHECK_INTERVAL}с)")
 
-    sent_confirmations = set()
+    sent_confirmations: set[int] = set()
 
     while True:
         try:
@@ -260,19 +261,12 @@ async def completion_loop(bot: Bot) -> None:
             due = get_bookings_ending_before(now_utc)
 
             for b in due:
-                bid = b["id"]
-
+                bid = int(b["id"])
                 if bid in sent_confirmations:
                     continue
 
                 master_name = b["master"]
-
-                # Ищем telegram_id мастера
-                tg_id = None
-                for slot in get_all_master_slots():
-                    if slot["name"] == master_name and slot.get("telegram_id"):
-                        tg_id = slot["telegram_id"]
-                        break
+                master_tg_id = b.get("master_tg_id")
 
                 msg = (
                     f"⏰ <b>Запись #{bid} завершилась</b>\n\n"
@@ -283,18 +277,18 @@ async def completion_loop(bot: Bot) -> None:
                     f"Подтвердите выполнение:"
                 )
 
-                targets = [tg_id] if tg_id else ADMIN_IDS
+                # Приоритет: мастер, если есть telegram_id; иначе админы
+                if master_tg_id:
+                    targets = [master_tg_id]
+                else:
+                    targets = ADMIN_IDS
 
                 for target in targets:
                     if not target:
                         continue
 
                     try:
-                        await bot.send_message(
-                            target,
-                            msg,
-                            reply_markup=completion_kb(bid)
-                        )
+                        await bot.send_message(target, msg, reply_markup=completion_kb(bid))
                         sent_confirmations.add(bid)
                         log.info(f"📨 Запрос подтверждения записи #{bid} → {target}")
                     except Exception:
@@ -342,7 +336,7 @@ async def stats_reporter_loop(bot: Bot) -> None:
 
                 log.info("📊 Статистика отправлена админам")
 
-            # Сбрасываем флаг в полночь
+            # Сбрасываем флаг в другое время
             if now.hour != 9:
                 last_send_hour = -1
 
@@ -361,7 +355,8 @@ async def main() -> None:
     log.info("🚀 Запуск Barbershop Bot...")
     log.info("=" * 70)
 
-    tasks = []
+    tasks: list[asyncio.Task] = []
+    bot: Bot | None = None
 
     try:
         # Инициализация БД
@@ -378,7 +373,7 @@ async def main() -> None:
         # Статистика БД
         stats = get_database_stats()
         log.info(
-            f"📊 Статистика БД: "
+            "📊 Статистика БД: "
             f"пользователей={stats['users']}, "
             f"слотов={stats['masters_slots']}, "
             f"активных={stats['active_bookings']}, "
@@ -389,7 +384,7 @@ async def main() -> None:
         log.info("🤖 Создание экземпляра бота...")
         bot = Bot(
             token=BOT_TOKEN,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
 
         # Проверка бота
@@ -426,7 +421,7 @@ async def main() -> None:
                     f"  👥 Пользователей: {stats['users']}\n"
                     f"  📅 Свободных слотов: {stats['masters_slots']}\n"
                     f"  ⏳ Активных записей: {stats['active_bookings']}\n"
-                    f"  ✅ Завершённых записей: {stats['completed_bookings']}"
+                    f"  ✅ Завершённых записей: {stats['completed_bookings']}",
                 )
             except Exception:
                 log.exception(f"❌ Не удалось уведомить админа {admin_id}")
@@ -448,14 +443,14 @@ async def main() -> None:
                 task.cancel()
                 log.info(f"🛑 Остановка задачи: {task.get_name()}")
 
-        # Ждём завершения всех задач
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Закрываем сессию бота
-        try:
-            await bot.session.close()
-        except:
-            pass
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
 
         log.info("=" * 70)
         log.info("👋 Бот успешно остановлен. До встречи!")
