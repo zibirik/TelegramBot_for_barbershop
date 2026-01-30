@@ -423,10 +423,10 @@ async def main() -> None:
                     f"🤖 @{bot_info.username}\n"
                     f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
                     f"📊 <b>Статистика:</b>\n"
-                    f"  👥 Пользователей: {stats['users']}\n"
-                    f"  📅 Свободных слотов: {stats['masters_slots']}\n"
-                    f"  ⏳ Активных записей: {stats['active_bookings']}\n"
-                    f"  ✅ Завершённых записей: {stats['completed_bookings']}"
+                    f" 👥 Пользователей: {stats['users']}\n"
+                    f" 📅 Свободных слотов: {stats['masters_slots']}\n"
+                    f" ⏳ Активных записей: {stats['active_bookings']}\n"
+                    f" ✅ Завершённых записей: {stats['completed_bookings']}"
                 )
             except Exception:
                 log.exception(f"❌ Не удалось уведомить админа {admin_id}")
