@@ -1,4 +1,7 @@
-# db.py – Production-ready SQLite DB layer for Barbershop Bot
+# db.py – Production-ready SQLite DB layer (v2-fixed for SQLite UNIQUE constraints)
+# Fix: no expressions (e.g., COALESCE) inside table UNIQUE constraints.
+# Compatible with: main.py / handlers.py from this thread
+
 from __future__ import annotations
 
 import logging
@@ -9,31 +12,59 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
+# --- config imports (safe) ---
 from config import DB_PATH, TIMEZONE, HAIRCUT_DURATIONS
 
-# ============================================================================
-# Logging & Timezone Setup
-# ============================================================================
+try:
+    from config import OLD_BOOKINGS_RETENTION_DAYS
+except Exception:
+    OLD_BOOKINGS_RETENTION_DAYS = 90
+
+try:
+    from config import BOOKING_GRACE_HOURS
+except Exception:
+    BOOKING_GRACE_HOURS = 2
+
+try:
+    from config import ENABLE_MULTI_BRANCH, BRANCHES
+except Exception:
+    ENABLE_MULTI_BRANCH = False
+    BRANCHES = {}
+
+try:
+    from config import ENABLE_PROMOCODES, PROMOCODE_DISCOUNTS, MAX_PROMOCODE_USES
+except Exception:
+    ENABLE_PROMOCODES = False
+    PROMOCODE_DISCOUNTS = {}
+    MAX_PROMOCODE_USES = 0
+
+try:
+    from config import ENABLE_ROLES, ENABLE_CLIENT_SEGMENTS
+except Exception:
+    ENABLE_ROLES = True
+    ENABLE_CLIENT_SEGMENTS = True
+
 log = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Timezone
+# -----------------------------------------------------------------------------
 try:
     from zoneinfo import ZoneInfo
 
     LOCAL_TZ = ZoneInfo(TIMEZONE) if TIMEZONE else dt_timezone.utc
-    log.info("db: Using stdlib.zoneinfo TZ='%s'", TIMEZONE or "UTC")
-except Exception as exc:
-    log.warning("db: Не удалось импортировать zoneinfo (%s). Используем UTC.", exc)
+except Exception:
     LOCAL_TZ = dt_timezone.utc
 
-# ============================================================================
-# Connection Pool (простой thread-safe пул)
-# ============================================================================
+
+# -----------------------------------------------------------------------------
+# SQLite connection handling
+# -----------------------------------------------------------------------------
 _connection_lock = Lock()
 
 
 @contextmanager
 def get_conn():
-    """Context manager для безопасного получения соединения с БД."""
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -52,11 +83,10 @@ def get_conn():
             cur.execute("PRAGMA journal_mode=WAL;")
             cur.execute("PRAGMA synchronous=NORMAL;")
             cur.execute("PRAGMA foreign_keys=ON;")
-            cur.execute("PRAGMA cache_size=-64000;")
             cur.execute("PRAGMA temp_store=MEMORY;")
             cur.close()
         except Exception:
-            log.exception("db: Не удалось задать PRAGMA-настройки")
+            log.exception("db: Failed to apply PRAGMA")
 
         try:
             yield conn
@@ -64,37 +94,101 @@ def get_conn():
             conn.close()
 
 
-# ============================================================================
-# Schema Initialization
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _utc_now() -> datetime:
+    return datetime.now(dt_timezone.utc)
+
+
+def _to_local_dt(date_str: str, time_str: str) -> datetime:
+    naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    return naive.replace(tzinfo=LOCAL_TZ)
+
+
+def _to_utc(local_dt: datetime) -> datetime:
+    return local_dt.astimezone(dt_timezone.utc)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {row["name"] for row in cur.fetchall()}
+    cur.close()
+    return cols
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> bool:
+    cols = _table_columns(conn, table)
+    if col in cols:
+        return False
+    cur = conn.cursor()
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+    cur.close()
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Init DB + migrations
+# -----------------------------------------------------------------------------
 def init_db() -> None:
-    """Инициализация БД с улучшенной схемой и индексами."""
     with get_conn() as conn:
         cur = conn.cursor()
 
-        cur.execute("""
+        # USERS
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT NOT NULL,
                 phone TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'client',
+                client_segment TEXT NOT NULL DEFAULT 'new',
+                total_bookings INTEGER NOT NULL DEFAULT 0,
+                total_spent INTEGER NOT NULL DEFAULT 0,
+                last_visit_date TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-        """)
+            """
+        )
 
-        cur.execute("""
+        # BRANCHES (optional)
+        if ENABLE_MULTI_BRANCH:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS branches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    address TEXT,
+                    phone TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+
+        # MASTERS slots
+        # IMPORTANT FIX: branch_code is NOT NULL DEFAULT '' so UNIQUE can be pure column list.
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS masters (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 telegram_id INTEGER,
+                branch_code TEXT NOT NULL DEFAULT '',
                 available_date TEXT NOT NULL,
                 available_time TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(name, available_date, available_time)
+                UNIQUE(name, branch_code, available_date, available_time)
             )
-        """)
+            """
+        )
 
-        cur.execute("""
+        # BOOKINGS
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS bookings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -103,9 +197,13 @@ def init_db() -> None:
                 phone TEXT NOT NULL,
                 haircut TEXT NOT NULL,
                 price INTEGER NOT NULL,
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                promocode TEXT,
+                branch_code TEXT NOT NULL DEFAULT '',
+                master TEXT NOT NULL,
+                master_tg_id INTEGER,
                 date TEXT NOT NULL,
                 time TEXT NOT NULL,
-                master TEXT NOT NULL,
                 duration_minutes INTEGER NOT NULL DEFAULT 60,
                 created_at TEXT NOT NULL,
                 remind_24_sent INTEGER NOT NULL DEFAULT 0,
@@ -117,9 +215,28 @@ def init_db() -> None:
                 completed_by INTEGER,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE SET NULL
             )
-        """)
+            """
+        )
 
-        cur.execute("""
+        # PROMOCODES (optional)
+        if ENABLE_PROMOCODES:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promocodes (
+                    code TEXT PRIMARY KEY,
+                    discount_percent INTEGER NOT NULL CHECK(discount_percent BETWEEN 0 AND 100),
+                    max_uses INTEGER NOT NULL DEFAULT 0,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    description TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+
+        # SUPPORT
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS support_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -135,77 +252,135 @@ def init_db() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
                 FOREIGN KEY(parent_id) REFERENCES support_messages(id) ON DELETE SET NULL
             )
-        """)
+            """
+        )
 
-        # Индексы
+        # Indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_segment ON users(client_segment)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_masters_date_time ON masters(available_date, available_time)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_masters_name ON masters(name)")
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_masters_telegram ON masters(telegram_id) WHERE telegram_id IS NOT NULL")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_master_date_time ON bookings(master, date, time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_masters_branch ON masters(branch_code)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_masters_telegram ON masters(telegram_id) WHERE telegram_id IS NOT NULL")
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id) WHERE user_id IS NOT NULL")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_completed ON bookings(completed)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_date_time ON bookings(date, time)")
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bookings_reminders ON bookings(remind_24_sent, remind_1_sent, remind_30_sent) WHERE completed = 0")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_master_date_time ON bookings(master, date, time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_branch ON bookings(branch_code)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_promocode ON bookings(promocode)")
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_support_handled ON support_messages(handled)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_support_user ON support_messages(user_id)")
 
         conn.commit()
+        cur.close()
 
-    _ensure_columns()
-    log.info("db: Инициализация завершена успешно")
-
-
-def _ensure_columns() -> None:
-    """Добавляет недостающие колонки для обратной совместимости."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("PRAGMA table_info(bookings)")
-        cols = {row["name"] for row in cur.fetchall()}
-
-        migrations = [
-            ("duration_minutes", "ALTER TABLE bookings ADD COLUMN duration_minutes INTEGER DEFAULT 60"),
-            ("completed", "ALTER TABLE bookings ADD COLUMN completed INTEGER DEFAULT 0"),
-            ("actual_paid", "ALTER TABLE bookings ADD COLUMN actual_paid INTEGER"),
-            ("completed_at", "ALTER TABLE bookings ADD COLUMN completed_at TEXT"),
-            ("completed_by", "ALTER TABLE bookings ADD COLUMN completed_by INTEGER"),
-            ("remind_30_sent", "ALTER TABLE bookings ADD COLUMN remind_30_sent INTEGER DEFAULT 0"),
-        ]
-
-        for col_name, sql in migrations:
-            if col_name not in cols:
-                cur.execute(sql)
-                log.info(f"db: Добавлена колонка bookings.{col_name}")
-
-        cur.execute("PRAGMA table_info(masters)")
-        mcols = {row["name"] for row in cur.fetchall()}
-
-        if "telegram_id" not in mcols:
-            cur.execute("ALTER TABLE masters ADD COLUMN telegram_id INTEGER")
-            log.info("db: Добавлена колонка masters.telegram_id")
-
-        cur.execute("PRAGMA table_info(support_messages)")
-        scols = {row["name"] for row in cur.fetchall()}
-
-        if "parent_id" not in scols:
-            cur.execute("ALTER TABLE support_messages ADD COLUMN parent_id INTEGER")
-            log.info("db: Добавлена колонка support_messages.parent_id")
+        _ensure_columns(conn)
+        _seed_branches(conn)
+        _seed_promocodes(conn)
 
         conn.commit()
+        log.info("db: init_db completed")
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    # USERS
+    _add_column_if_missing(conn, "users", "role", "role TEXT NOT NULL DEFAULT 'client'")
+    _add_column_if_missing(conn, "users", "client_segment", "client_segment TEXT NOT NULL DEFAULT 'new'")
+    _add_column_if_missing(conn, "users", "total_bookings", "total_bookings INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "users", "total_spent", "total_spent INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "users", "last_visit_date", "last_visit_date TEXT")
+
+    # MASTERS
+    _add_column_if_missing(conn, "masters", "telegram_id", "telegram_id INTEGER")
+    added_branch = _add_column_if_missing(conn, "masters", "branch_code", "branch_code TEXT NOT NULL DEFAULT ''")
+    # if column existed but nullable in old DB, normalize NULL -> ''
+    try:
+        conn.execute("UPDATE masters SET branch_code='' WHERE branch_code IS NULL")
+    except Exception:
+        pass
+
+    # BOOKINGS
+    _add_column_if_missing(conn, "bookings", "duration_minutes", "duration_minutes INTEGER NOT NULL DEFAULT 60")
+    _add_column_if_missing(conn, "bookings", "completed", "completed INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "bookings", "actual_paid", "actual_paid INTEGER")
+    _add_column_if_missing(conn, "bookings", "completed_at", "completed_at TEXT")
+    _add_column_if_missing(conn, "bookings", "completed_by", "completed_by INTEGER")
+
+    _add_column_if_missing(conn, "bookings", "remind_24_sent", "remind_24_sent INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "bookings", "remind_1_sent", "remind_1_sent INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "bookings", "remind_30_sent", "remind_30_sent INTEGER NOT NULL DEFAULT 0")
+
+    _add_column_if_missing(conn, "bookings", "discount_percent", "discount_percent INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "bookings", "promocode", "promocode TEXT")
+    _add_column_if_missing(conn, "bookings", "branch_code", "branch_code TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "bookings", "master_tg_id", "master_tg_id INTEGER")
+
+    try:
+        conn.execute("UPDATE bookings SET branch_code='' WHERE branch_code IS NULL")
+    except Exception:
+        pass
+
+    # SUPPORT
+    _add_column_if_missing(conn, "support_messages", "parent_id", "parent_id INTEGER")
+
+    # Ensure uniqueness for masters slots even on old DBs:
+    # If table was created without UNIQUE(name, branch_code, available_date, available_time),
+    # this unique index will enforce it.
+    try:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_masters_slot
+            ON masters(name, branch_code, available_date, available_time)
+            """
+        )
+    except Exception:
+        # If duplicates exist, index creation can fail. It's better to log and continue.
+        log.exception("db: Failed to create uq_masters_slot (duplicates?)")
 
 
 def ensure_support_parent_column() -> None:
-    """Обратная совместимость."""
-    _ensure_columns()
+    with get_conn() as conn:
+        _ensure_columns(conn)
+        conn.commit()
 
 
-# ============================================================================
-# User Management
-# ============================================================================
+def _seed_branches(conn: sqlite3.Connection) -> None:
+    if not ENABLE_MULTI_BRANCH:
+        return
+    try:
+        for code, data in (BRANCHES or {}).items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO branches (code, name, address, phone, active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (code, data.get("name", code), data.get("address"), data.get("phone")),
+            )
+    except Exception:
+        log.exception("db: Failed seeding branches")
+
+
+def _seed_promocodes(conn: sqlite3.Connection) -> None:
+    if not ENABLE_PROMOCODES:
+        return
+    try:
+        for code, discount in (PROMOCODE_DISCOUNTS or {}).items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO promocodes (code, discount_percent, max_uses, used_count, active, description)
+                VALUES (?, ?, ?, 0, 1, ?)
+                """,
+                (code.strip().upper(), int(discount), int(MAX_PROMOCODE_USES), f"{discount}%"),
+            )
+    except Exception:
+        log.exception("db: Failed seeding promocodes")
+
+
+# -----------------------------------------------------------------------------
+# USERS
+# -----------------------------------------------------------------------------
 def add_user(user_id: int, full_name: str, phone: str) -> None:
-    """Добавляет или обновляет пользователя."""
     with get_conn() as conn:
         conn.execute(
             """
@@ -216,874 +391,813 @@ def add_user(user_id: int, full_name: str, phone: str) -> None:
                 phone = excluded.phone,
                 updated_at = datetime('now')
             """,
-            (user_id, full_name, phone),
+            (int(user_id), full_name, phone),
         )
         conn.commit()
 
 
 def get_user(user_id: int) -> Optional[Tuple[str, str]]:
-    """Получает данные пользователя (full_name, phone)."""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT full_name, phone FROM users WHERE user_id = ?", (user_id,))
+        cur.execute("SELECT full_name, phone FROM users WHERE user_id=?", (int(user_id),))
         row = cur.fetchone()
+        cur.close()
         return (row["full_name"], row["phone"]) if row else None
 
 
-# ============================================================================
-# Master Schedule Management
-# ============================================================================
+# -----------------------------------------------------------------------------
+# PROMOCODES
+# -----------------------------------------------------------------------------
+def validate_promocode(code: str) -> Optional[Dict[str, Any]]:
+    if not ENABLE_PROMOCODES:
+        return None
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT code, discount_percent, max_uses, used_count, active
+            FROM promocodes
+            WHERE code=? AND active=1
+            """,
+            (code,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        if int(row["used_count"]) >= int(row["max_uses"]):
+            return None
+        return {
+            "code": row["code"],
+            "discount_percent": int(row["discount_percent"]),
+            "uses_left": int(row["max_uses"]) - int(row["used_count"]),
+        }
+
+
+def use_promocode(code: str) -> bool:
+    if not ENABLE_PROMOCODES:
+        return False
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE promocodes
+            SET used_count = used_count + 1
+            WHERE code=? AND active=1 AND used_count < max_uses
+            """,
+            (code,),
+        )
+        ok = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        return ok
+
+
+# -----------------------------------------------------------------------------
+# MASTERS / SLOTS
+# -----------------------------------------------------------------------------
 def update_master_schedule(
-        name: str,
-        start_date: str,
-        end_date: str,
-        start_time: str,
-        end_time: str,
-        step_minutes: int = 60,
-        telegram_id: Optional[int] = None,
+    name: str,
+    start_date: str,
+    end_date: str,
+    start_time: str,
+    end_time: str,
+    step_minutes: int = 60,
+    telegram_id: Optional[int] = None,
+    branch_code: Optional[str] = None,
 ) -> None:
-    """Создаёт расписание для мастера на указанный период."""
-    try:
-        sd = datetime.strptime(start_date, "%Y-%m-%d").date()
-        ed = datetime.strptime(end_date, "%Y-%m-%d").date()
-        st = datetime.strptime(start_time, "%H:%M").time()
-        et = datetime.strptime(end_time, "%H:%M").time()
-    except Exception as exc:
-        raise ValueError("Invalid date/time format for master schedule") from exc
+    sd = datetime.strptime(start_date, "%Y-%m-%d").date()
+    ed = datetime.strptime(end_date, "%Y-%m-%d").date()
+    st = datetime.strptime(start_time, "%H:%M").time()
+    et = datetime.strptime(end_time, "%H:%M").time()
 
     if ed < sd:
         raise ValueError("Конечная дата не может быть раньше начальной")
-    if et <= st:
+    if datetime.combine(sd, et) <= datetime.combine(sd, st):
         raise ValueError("Конечное время не может быть раньше или равно начальному")
     if step_minutes <= 0:
         raise ValueError("Шаг должен быть положительным числом")
 
-    slots = []
+    bc = (branch_code or "") if ENABLE_MULTI_BRANCH else ""
+    slots: List[Tuple[str, Optional[int], str, str, str]] = []
+
     cur_date = sd
-
     while cur_date <= ed:
-        # Начинаем с начального времени каждый день
-        cur_datetime = datetime.combine(cur_date, st)
-        end_datetime = datetime.combine(cur_date, et)
-
-        # Генерируем слоты для текущего дня
-        while cur_datetime < end_datetime:
-            slots.append((
-                name,
-                telegram_id,
-                cur_date.strftime("%Y-%m-%d"),
-                cur_datetime.time().strftime("%H:%M"),
-            ))
-            # Добавляем шаг
-            cur_datetime += timedelta(minutes=step_minutes)
-
-        # Переходим к следующему дню
+        cur_dt = datetime.combine(cur_date, st)
+        end_dt = datetime.combine(cur_date, et)
+        while cur_dt < end_dt:
+            slots.append(
+                (
+                    name,
+                    telegram_id,
+                    bc,
+                    cur_date.strftime("%Y-%m-%d"),
+                    cur_dt.time().strftime("%H:%M"),
+                )
+            )
+            cur_dt += timedelta(minutes=step_minutes)
         cur_date += timedelta(days=1)
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.executemany(
             """
-            INSERT OR IGNORE INTO masters (name, telegram_id, available_date, available_time)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO masters (name, telegram_id, branch_code, available_date, available_time)
+            VALUES (?, ?, ?, ?, ?)
             """,
             slots,
         )
         conn.commit()
-        log.info(f"db: Добавлено {len(slots)} слотов для мастера '{name}'")
-
-
-def get_all_master_slots() -> List[Dict[str, Any]]:
-    """Возвращает все слоты мастеров."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, name, telegram_id, available_date, available_time
-            FROM masters
-            ORDER BY available_date, available_time, name
-        """)
-        return [dict(row) for row in cur.fetchall()]
+        cur.close()
 
 
 def set_master_telegram(master_name: str, telegram_id: int) -> int:
-    """Привязывает telegram_id к мастеру."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE masters SET telegram_id=? WHERE name=?", (int(telegram_id), master_name))
+        conn.commit()
+        n = cur.rowcount
+        cur.close()
+        return int(n)
+
+
+def get_all_master_slots() -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE masters SET telegram_id = ? WHERE name = ?",
-            (telegram_id, master_name),
+            """
+            SELECT id, name, telegram_id, branch_code, available_date, available_time
+            FROM masters
+            ORDER BY available_date, available_time, name
+            """
         )
-        conn.commit()
-        return cur.rowcount
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        return rows
 
 
-# ============================================================================
-# Availability Queries
-# ============================================================================
-def get_available_dates(master_name: Optional[str] = None) -> List[str]:
-    """Получает доступные даты."""
+def remove_master_slots(slot_id: int) -> int:
+    """Delete one slot by id. Returns 0/1."""
     with get_conn() as conn:
         cur = conn.cursor()
+        cur.execute("DELETE FROM masters WHERE id=?", (int(slot_id),))
+        conn.commit()
+        n = cur.rowcount
+        cur.close()
+        return int(n)
 
+
+def remove_master_slots_by_name(master_name: str) -> int:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM masters WHERE name=?", (master_name,))
+        conn.commit()
+        n = cur.rowcount
+        cur.close()
+        return int(n)
+
+
+def remove_expired_master_slots() -> int:
+    now_local = datetime.now(LOCAL_TZ)
+    removed = 0
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, available_date, available_time FROM masters")
+        rows = cur.fetchall()
+        for r in rows:
+            try:
+                slot_local = _to_local_dt(r["available_date"], r["available_time"])
+            except Exception:
+                cur.execute("DELETE FROM masters WHERE id=?", (int(r["id"]),))
+                removed += 1
+                continue
+            if slot_local < now_local:
+                cur.execute("DELETE FROM masters WHERE id=?", (int(r["id"]),))
+                removed += 1
+        conn.commit()
+        cur.close()
+    return removed
+
+
+# -----------------------------------------------------------------------------
+# Availability for booking
+# -----------------------------------------------------------------------------
+def get_available_dates(master_name: Optional[str] = None) -> List[str]:
+    with get_conn() as conn:
+        cur = conn.cursor()
         if master_name:
-            cur.execute("""
-                SELECT DISTINCT m.available_date
-                FROM masters m
-                WHERE m.name = ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.master = m.name
-                    AND b.date = m.available_date
-                    AND b.time = m.available_time
-                    AND b.completed = 0
-                )
-                ORDER BY m.available_date
-            """, (master_name,))
+            cur.execute(
+                """
+                SELECT DISTINCT available_date
+                FROM masters
+                WHERE name=?
+                ORDER BY available_date
+                """,
+                (master_name,),
+            )
         else:
-            cur.execute("""
-                SELECT DISTINCT m.available_date
-                FROM masters m
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.master = m.name
-                    AND b.date = m.available_date
-                    AND b.time = m.available_time
-                    AND b.completed = 0
-                )
-                ORDER BY m.available_date
-            """)
-
-        return [row["available_date"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT DISTINCT available_date
+                FROM masters
+                ORDER BY available_date
+                """
+            )
+        dates = [row["available_date"] for row in cur.fetchall()]
+        cur.close()
+        return dates
 
 
 def get_available_times(date: str, master_name: Optional[str] = None) -> List[str]:
-    """Получает доступные времена на указанную дату."""
     with get_conn() as conn:
         cur = conn.cursor()
-
         if master_name:
-            cur.execute("""
-                SELECT m.available_time
-                FROM masters m
-                WHERE m.available_date = ?
-                AND m.name = ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.master = m.name
-                    AND b.date = m.available_date
-                    AND b.time = m.available_time
-                    AND b.completed = 0
-                )
-                ORDER BY m.available_time
-            """, (date, master_name))
+            cur.execute(
+                """
+                SELECT available_time
+                FROM masters
+                WHERE available_date=? AND name=?
+                ORDER BY available_time
+                """,
+                (date, master_name),
+            )
         else:
-            cur.execute("""
-                SELECT DISTINCT m.available_time
-                FROM masters m
-                WHERE m.available_date = ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.master = m.name
-                    AND b.date = m.available_date
-                    AND b.time = m.available_time
-                    AND b.completed = 0
-                )
-                ORDER BY m.available_time
-            """, (date,))
-
-        return [row["available_time"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT DISTINCT available_time
+                FROM masters
+                WHERE available_date=?
+                ORDER BY available_time
+                """,
+                (date,),
+            )
+        times = [row["available_time"] for row in cur.fetchall()]
+        cur.close()
+        return times
 
 
 def get_available_masters(date: str, time: str) -> List[str]:
-    """Получает доступных мастеров на указанные дату и время."""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT m.name
-            FROM masters m
-            WHERE m.available_date = ?
-            AND m.available_time = ?
-            AND NOT EXISTS (
-                SELECT 1 FROM bookings b
-                WHERE b.master = m.name
-                AND b.date = m.available_date
-                AND b.time = m.available_time
-                AND b.completed = 0
-            )
-            ORDER BY m.name
-        """, (date, time))
-
-        return [row["name"] for row in cur.fetchall()]
-
-
-# ============================================================================
-# Booking Management
-# ============================================================================
-def add_booking(
-        user_id: int,
-        username: str,
-        full_name: str,
-        phone: str,
-        haircut: str,
-        price: int,
-        date: str,
-        time: str,
-        master: str,
-        duration_minutes: Optional[int] = None,
-) -> int:
-    """Создаёт новую запись."""
-    if duration_minutes is None:
-        duration_minutes = HAIRCUT_DURATIONS.get(haircut, 60)
-
-    # Проверка прошедшего времени
-    try:
-        booking_naive = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-        booking_local = booking_naive.replace(tzinfo=LOCAL_TZ)
-        booking_utc = booking_local.astimezone(dt_timezone.utc)
-        now_utc = datetime.now(dt_timezone.utc)
-
-        if booking_utc < now_utc:
-            raise ValueError("❌ Нельзя создать запись на прошедшее время")
-    except ValueError as e:
-        if "Нельзя создать" in str(e):
-            raise
-        raise ValueError("❌ Неверный формат даты или времени")
-
-    created_at = datetime.now(dt_timezone.utc).isoformat()
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT id FROM masters
-            WHERE name = ? AND available_date = ? AND available_time = ?
-            LIMIT 1
-        """, (master, date, time))
-        slot = cur.fetchone()
-
-        if not slot:
-            raise ValueError("❌ Выбранный слот не существует или уже удалён")
-
-        cur.execute("""
-            SELECT id FROM bookings
-            WHERE master = ? AND date = ? AND time = ? AND completed = 0
-            LIMIT 1
-        """, (master, date, time))
-
-        if cur.fetchone():
-            raise ValueError("❌ Слот уже занят другим клиентом")
-
-        cur.execute("""
-            INSERT INTO bookings
-            (user_id, username, full_name, phone, haircut, price,
-             date, time, master, duration_minutes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id, username, full_name, phone, haircut, price,
-            date, time, master, duration_minutes, created_at,
-        ))
-        booking_id = cur.lastrowid
-
-        cur.execute("DELETE FROM masters WHERE id = ?", (slot["id"],))
-
-        conn.commit()
-        log.info(f"db: Создана запись #{booking_id} для {full_name} на {date} {time}")
-        return booking_id
+        cur.execute(
+            """
+            SELECT DISTINCT name
+            FROM masters
+            WHERE available_date=? AND available_time=?
+            ORDER BY name
+            """,
+            (date, time),
+        )
+        masters = [row["name"] for row in cur.fetchall()]
+        cur.close()
+        return masters
 
 
 def check_booking(master: str, date: str, time: str) -> bool:
-    """Проверяет, занят ли слот."""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
             SELECT 1 FROM bookings
-            WHERE master = ? AND date = ? AND time = ? AND completed = 0
+            WHERE master=? AND date=? AND time=? AND completed=0
             LIMIT 1
             """,
             (master, date, time),
         )
-        return cur.fetchone() is not None
+        ok = cur.fetchone() is not None
+        cur.close()
+        return ok
+
+
+# -----------------------------------------------------------------------------
+# BOOKINGS
+# -----------------------------------------------------------------------------
+def add_booking(
+    user_id: int,
+    username: str,
+    full_name: str,
+    phone: str,
+    haircut: str,
+    price: int,
+    date: str,
+    time: str,
+    master: str,
+    duration_minutes: Optional[int] = None,
+    branch_code: Optional[str] = None,
+    promocode: Optional[str] = None,
+    discount_percent: int = 0,
+) -> int:
+    if duration_minutes is None:
+        duration_minutes = int(HAIRCUT_DURATIONS.get(haircut, 60))
+
+    # cannot book in the past
+    local_dt = _to_local_dt(date, time)
+    if _to_utc(local_dt) < _utc_now():
+        raise ValueError("❌ Нельзя создать запись на прошедшее время")
+
+    promo_code_norm: Optional[str] = None
+    promo_discount = 0
+    if ENABLE_PROMOCODES and promocode:
+        info = validate_promocode(promocode)
+        if info:
+            promo_code_norm = info["code"]
+            promo_discount = int(info["discount_percent"])
+
+    final_discount = int(promo_discount if promo_discount > 0 else (discount_percent or 0))
+    final_discount = max(0, min(100, final_discount))
+
+    created_at = _utc_now().isoformat()
+    bc = (branch_code or "") if ENABLE_MULTI_BRANCH else ""
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id, telegram_id, branch_code
+            FROM masters
+            WHERE name=? AND available_date=? AND available_time=?
+            LIMIT 1
+            """,
+            (master, date, time),
+        )
+        slot = cur.fetchone()
+        if not slot:
+            cur.close()
+            raise ValueError("❌ Выбранный слот не существует или уже занят")
+
+        # prefer slot branch
+        slot_bc = slot["branch_code"] if slot["branch_code"] is not None else ""
+        stored_branch = slot_bc if slot_bc != "" else bc
+
+        # double-check no active booking
+        cur.execute(
+            """
+            SELECT 1 FROM bookings
+            WHERE master=? AND date=? AND time=? AND completed=0
+            LIMIT 1
+            """,
+            (master, date, time),
+        )
+        if cur.fetchone():
+            cur.close()
+            raise ValueError("❌ Слот уже занят другим клиентом")
+
+        cur.execute(
+            """
+            INSERT INTO bookings
+            (user_id, username, full_name, phone, haircut, price,
+             discount_percent, promocode, branch_code,
+             master, master_tg_id,
+             date, time, duration_minutes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id),
+                username,
+                full_name,
+                phone,
+                haircut,
+                int(price),
+                int(final_discount),
+                promo_code_norm,
+                stored_branch,
+                master,
+                slot["telegram_id"],
+                date,
+                time,
+                int(duration_minutes),
+                created_at,
+            ),
+        )
+        booking_id = int(cur.lastrowid)
+
+        # consume promocode
+        if promo_code_norm:
+            use_promocode(promo_code_norm)
+
+        # remove slot
+        cur.execute("DELETE FROM masters WHERE id=?", (int(slot["id"]),))
+
+        conn.commit()
+        cur.close()
+
+    return booking_id
 
 
 def get_user_bookings(user_id: int) -> List[Tuple]:
-    """Получает активные записи пользователя."""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, haircut, price, date, time, master
             FROM bookings
-            WHERE user_id = ? AND completed = 0
+            WHERE user_id=? AND completed=0
             ORDER BY date, time
-        """, (user_id,))
-        return [tuple(row) for row in cur.fetchall()]
+            """,
+            (int(user_id),),
+        )
+        rows = [tuple(r) for r in cur.fetchall()]
+        cur.close()
+        return rows
 
 
 def get_booking_by_id(booking_id: int) -> Optional[Tuple]:
-    """Получает детали записи по ID."""
+    # handlers.py expects booking[6]=date and booking[7]=time
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, username, full_name, phone, haircut, price,
-                   date, time, master, duration_minutes,
-                   remind_24_sent, remind_1_sent, remind_30_sent, completed,
-                   actual_paid, completed_at, completed_by
+        cur.execute(
+            """
+            SELECT
+                id, user_id, username, full_name, phone, haircut,
+                date, time, master,
+                price, duration_minutes,
+                remind_24_sent, remind_1_sent, remind_30_sent,
+                completed, actual_paid, completed_at, completed_by,
+                discount_percent, promocode, branch_code, master_tg_id, created_at
             FROM bookings
-            WHERE id = ?
-        """, (booking_id,))
+            WHERE id=?
+            """,
+            (int(booking_id),),
+        )
         row = cur.fetchone()
+        cur.close()
         return tuple(row) if row else None
 
 
 def cancel_booking(booking_id: int, force: bool = False) -> bool:
-    """Отменяет запись и возвращает слот в доступные."""
     with get_conn() as conn:
         cur = conn.cursor()
-
-        cur.execute("""
-            SELECT id, user_id, username, full_name, phone,
-                   haircut, price, date, time, master
+        cur.execute(
+            """
+            SELECT id, completed, master, master_tg_id, branch_code, date, time
             FROM bookings
-            WHERE id = ?
-            LIMIT 1
-        """, (booking_id,))
+            WHERE id=?
+            """,
+            (int(booking_id),),
+        )
         b = cur.fetchone()
-
         if not b:
+            cur.close()
             return False
 
-        # Получаем telegram_id мастера
-        cur.execute("SELECT telegram_id FROM masters WHERE name = ? LIMIT 1", (b["master"],))
-        master_row = cur.fetchone()
-        tg_id = master_row["telegram_id"] if master_row else None
+        if int(b["completed"] or 0) == 1 and not force:
+            cur.close()
+            return False
 
-        # Удаляем запись
-        cur.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
+        # delete booking
+        cur.execute("DELETE FROM bookings WHERE id=?", (int(booking_id),))
 
-        # Возвращаем слот если не прошёл
+        # restore slot if still future
         try:
-            slot_dt = datetime.strptime(f"{b['date']} {b['time']}", "%Y-%m-%d %H:%M")
-            slot_local = slot_dt.replace(tzinfo=LOCAL_TZ)
-            now_local = datetime.now(LOCAL_TZ)
-
-            if slot_local >= now_local:
-                cur.execute("""
-                    INSERT OR IGNORE INTO masters (name, telegram_id, available_date, available_time)
-                    VALUES (?, ?, ?, ?)
-                """, (b["master"], tg_id, b["date"], b["time"]))
+            slot_local = _to_local_dt(b["date"], b["time"])
+            if slot_local >= datetime.now(LOCAL_TZ):
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO masters (name, telegram_id, branch_code, available_date, available_time)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        b["master"],
+                        b["master_tg_id"],
+                        (b["branch_code"] or ""),
+                        b["date"],
+                        b["time"],
+                    ),
+                )
         except Exception:
-            log.exception("db: Ошибка возврата слота #%s", booking_id)
+            log.exception("db: Failed to restore slot for canceled booking #%s", booking_id)
 
         conn.commit()
-        log.info(f"db: Отменена запись #{booking_id}")
+        cur.close()
         return True
 
 
 def get_all_bookings_for_admin() -> List[Tuple]:
-    """Получает все записи для админ-панели."""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, username, full_name, phone, haircut, price,
-                   date, time, master, duration_minutes,
-                   completed, actual_paid
+        cur.execute(
+            """
+            SELECT
+                id, username, full_name, phone, haircut, price,
+                date, time, master, duration_minutes,
+                completed, actual_paid
             FROM bookings
             ORDER BY date DESC, time DESC
-        """)
-        return [tuple(row) for row in cur.fetchall()]
+            """
+        )
+        rows = [tuple(r) for r in cur.fetchall()]
+        cur.close()
+        return rows
 
 
-# ============================================================================
-# Reminder System
-# ============================================================================
-def get_all_bookings_due_between(
-        start_dt: datetime, end_dt: datetime
-) -> List[Dict[str, Any]]:
-    """Получает записи в указанном временном окне."""
+def mark_booking_completed(booking_id: int, actual_paid: int, completed_by: int) -> bool:
+    completed_at = _utc_now().isoformat()
+
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, username, full_name, phone,
-                   haircut, price, date, time, master,
-                   duration_minutes, remind_24_sent, remind_1_sent, remind_30_sent
-            FROM bookings
-            WHERE completed = 0
-        """)
-        rows = cur.fetchall()
-
-    result: List[Dict[str, Any]] = []
-
-    for r in rows:
-        try:
-            local_naive = datetime.strptime(f"{r['date']} {r['time']}", "%Y-%m-%d %H:%M")
-            local_dt = local_naive.replace(tzinfo=LOCAL_TZ)
-            utc_dt = local_dt.astimezone(dt_timezone.utc)
-        except Exception:
-            log.warning("db: malformed datetime for booking id=%s – skip", r["id"])
-            continue
-
-        if start_dt <= utc_dt <= end_dt:
-            dur = int(r["duration_minutes"] or 60)
-            result.append({
-                "id": r["id"],
-                "user_id": r["user_id"],
-                "username": r["username"],
-                "full_name": r["full_name"],
-                "phone": r["phone"],
-                "haircut": r["haircut"],
-                "price": r["price"],
-                "datetime": utc_dt,
-                "date": r["date"],
-                "time": r["time"],
-                "duration_minutes": dur,
-                "master": r["master"],
-                "remind_24_sent": bool(r["remind_24_sent"]),
-                "remind_1_sent": bool(r["remind_1_sent"]),
-                "remind_30_sent": bool(r["remind_30_sent"]),
-            })
-
-    return result
-
-
-def mark_reminder_sent(booking_id: int, hours: float) -> None:
-    """Отмечает отправленное напоминание."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        if hours == 24:
-            cur.execute("UPDATE bookings SET remind_24_sent = 1 WHERE id = ?", (booking_id,))
-        elif hours == 1:
-            cur.execute("UPDATE bookings SET remind_1_sent = 1 WHERE id = ?", (booking_id,))
-        elif hours == 0.5:
-            cur.execute("UPDATE bookings SET remind_30_sent = 1 WHERE id = ?", (booking_id,))
-
+        cur.execute(
+            """
+            UPDATE bookings
+            SET completed=1, actual_paid=?, completed_at=?, completed_by=?
+            WHERE id=?
+            """,
+            (int(actual_paid), completed_at, int(completed_by), int(booking_id)),
+        )
+        ok = cur.rowcount > 0
         conn.commit()
+        cur.close()
+        return ok
 
 
-# ============================================================================
-# Completion System
-# ============================================================================
-def get_bookings_ending_before(cutoff_utc: datetime) -> List[Dict[str, Any]]:
-    """Получает записи, которые должны были завершиться."""
+def get_completed_bookings(start_dt_utc: datetime, end_dt_utc: datetime) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, username, full_name, phone,
-                   haircut, price, date, time, master, duration_minutes
+        cur.execute(
+            """
+            SELECT
+                id, user_id, full_name, phone, haircut, price, date, time, master,
+                actual_paid, completed_at, branch_code, promocode, discount_percent
             FROM bookings
-            WHERE completed = 0
-        """)
-        rows = cur.fetchall()
+            WHERE completed=1
+              AND completed_at IS NOT NULL
+              AND completed_at >= ?
+              AND completed_at <= ?
+            ORDER BY completed_at DESC
+            """,
+            (start_dt_utc.isoformat(), end_dt_utc.isoformat()),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        return rows
 
+
+# -----------------------------------------------------------------------------
+# Reminders (main.py)
+# -----------------------------------------------------------------------------
+def get_all_bookings_due_between(window_start_utc: datetime, window_end_utc: datetime) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                id, user_id, full_name, phone, haircut, price, master,
+                date, time,
+                remind_24_sent, remind_1_sent, remind_30_sent
+            FROM bookings
+            WHERE completed=0 AND user_id IS NOT NULL
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
 
     for r in rows:
         try:
-            start_naive = datetime.strptime(f"{r['date']} {r['time']}", "%Y-%m-%d %H:%M")
-            start_local = start_naive.replace(tzinfo=LOCAL_TZ)
-            start_utc = start_local.astimezone(dt_timezone.utc)
+            utc_dt = _to_utc(_to_local_dt(r["date"], r["time"]))
         except Exception:
             continue
-
-        dur = int(r["duration_minutes"] or 60)
-        end_utc = start_utc + timedelta(minutes=dur)
-
-        if end_utc <= cutoff_utc:
-            out.append({
-                "id": r["id"],
-                "user_id": r["user_id"],
-                "username": r["username"],
-                "full_name": r["full_name"],
-                "phone": r["phone"],
-                "haircut": r["haircut"],
-                "price": r["price"],
-                "start_utc": start_utc,
-                "end_utc": end_utc,
-                "duration_minutes": dur,
-                "master": r["master"],
-            })
-
+        if window_start_utc <= utc_dt <= window_end_utc:
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "user_id": int(r["user_id"]),
+                    "full_name": r["full_name"],
+                    "phone": r["phone"],
+                    "haircut": r["haircut"],
+                    "price": int(r["price"]),
+                    "master": r["master"],
+                    "datetime": utc_dt,
+                    "remind_24_sent": int(r["remind_24_sent"] or 0),
+                    "remind_1_sent": int(r["remind_1_sent"] or 0),
+                    "remind_30_sent": int(r["remind_30_sent"] or 0),
+                }
+            )
     return out
 
 
-def mark_booking_completed(
-        booking_id: int,
-        actual_paid: Optional[int],
-        completed_by: Optional[int] = None,
-        succeeded: bool = True,
-) -> bool:
-    """Отмечает запись как завершённую."""
-    completed_at = datetime.now(dt_timezone.utc).isoformat()
+def mark_reminder_sent(booking_id: int, hours: float) -> None:
+    col = None
+    if hours == 24:
+        col = "remind_24_sent"
+    elif hours == 1:
+        col = "remind_1_sent"
+    elif hours == 0.5:
+        col = "remind_30_sent"
+    else:
+        return
 
     with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE bookings
-            SET completed = 1,
-                actual_paid = ?,
-                completed_at = ?,
-                completed_by = ?
-            WHERE id = ?
-        """, (actual_paid, completed_at, completed_by, booking_id))
+        conn.execute(f"UPDATE bookings SET {col}=1 WHERE id=?", (int(booking_id),))
         conn.commit()
 
-        if cur.rowcount > 0:
-            log.info(f"db: Запись #{booking_id} отмечена как завершённая")
-            return True
-        return False
 
+def get_bookings_ending_before(now_utc: datetime, lookback_minutes: int = 180) -> List[Dict[str, Any]]:
+    res: List[Dict[str, Any]] = []
+    cutoff = now_utc - timedelta(minutes=int(lookback_minutes))
 
-def get_completed_bookings(
-        start_dt: Optional[datetime] = None,
-        end_dt: Optional[datetime] = None,
-) -> List[Dict[str, Any]]:
-    """Получает завершённые записи."""
     with get_conn() as conn:
         cur = conn.cursor()
-
-        sql = """
-            SELECT id, user_id, username, full_name, phone,
-                   haircut, price, date, time, master,
-                   duration_minutes, actual_paid, completed_at
+        cur.execute(
+            """
+            SELECT
+                id, user_id, full_name, phone, haircut, price, master,
+                date, time, duration_minutes, master_tg_id, branch_code
             FROM bookings
-            WHERE completed = 1
-        """
-        params: List[Any] = []
-
-        if start_dt and end_dt:
-            sql += " AND datetime(completed_at) BETWEEN datetime(?) AND datetime(?)"
-            params.extend([start_dt.isoformat(), end_dt.isoformat()])
-
-        sql += " ORDER BY completed_at DESC"
-
-        cur.execute(sql, params)
+            WHERE completed=0
+            """
+        )
         rows = cur.fetchall()
+        cur.close()
 
-        return [
-            {
-                "id": r["id"],
-                "user_id": r["user_id"],
-                "username": r["username"],
-                "full_name": r["full_name"],
-                "phone": r["phone"],
-                "haircut": r["haircut"],
-                "price": r["price"],
-                "date": r["date"],
-                "time": r["time"],
-                "master": r["master"],
-                "duration_minutes": r["duration_minutes"],
-                "actual_paid": r["actual_paid"],
-                "completed_at": r["completed_at"],
-            }
-            for r in rows
-        ]
+    for r in rows:
+        try:
+            start_utc = _to_utc(_to_local_dt(r["date"], r["time"]))
+            end_utc = start_utc + timedelta(minutes=int(r["duration_minutes"] or 60))
+        except Exception:
+            continue
+
+        if cutoff <= end_utc <= now_utc:
+            res.append(
+                {
+                    "id": int(r["id"]),
+                    "user_id": r["user_id"],
+                    "full_name": r["full_name"],
+                    "phone": r["phone"],
+                    "haircut": r["haircut"],
+                    "price": int(r["price"]),
+                    "master": r["master"],
+                    "master_tg_id": r["master_tg_id"],
+                    "branch_code": r["branch_code"],
+                    "start_utc": start_utc,
+                    "end_utc": end_utc,
+                }
+            )
+    return res
 
 
-# ============================================================================
-# Support Messages
-# ============================================================================
-def add_support_message(
-        user_id: int,
-        username: str,
-        full_name: str,
-        phone: str,
-        text: str,
-        parent_id: Optional[int] = None,
-) -> int:
-    """Добавляет сообщение в техподдержку."""
-    created_at = datetime.now(dt_timezone.utc).isoformat()
-
+# -----------------------------------------------------------------------------
+# SUPPORT
+# -----------------------------------------------------------------------------
+def add_support_message(user_id: int, username: str, full_name: str, phone: str, text: str) -> int:
+    created_at = _utc_now().isoformat()
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO support_messages
-            (user_id, username, full_name, phone, text, created_at, parent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, username, full_name, phone, text, created_at, parent_id))
+            (user_id, username, full_name, phone, text, created_at, handled)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (int(user_id), username, full_name, phone, text, created_at),
+        )
+        sid = int(cur.lastrowid)
         conn.commit()
-        return cur.lastrowid
+        cur.close()
+        return sid
 
 
-def get_pending_supports() -> List[Tuple]:
-    """Получает необработанные обращения."""
+def get_pending_supports(limit: int = 20) -> List[Tuple]:
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, user_id, username, full_name, phone, text, created_at
             FROM support_messages
-            WHERE handled = 0
-            ORDER BY created_at
-        """)
-        return [tuple(row) for row in cur.fetchall()]
+            WHERE handled=0
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = [tuple(r) for r in cur.fetchall()]
+        cur.close()
+        return rows
 
 
 def get_support_by_id(support_id: int) -> Optional[Tuple]:
-    """Получает обращение по ID."""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, username, full_name, phone, text,
-                   created_at, handled, admin_id, admin_reply, parent_id
+        cur.execute(
+            """
+            SELECT id, user_id, username, full_name, phone, text, created_at,
+                   handled, admin_id, admin_reply, parent_id
             FROM support_messages
-            WHERE id = ?
-        """, (support_id,))
+            WHERE id=?
+            """,
+            (int(support_id),),
+        )
         row = cur.fetchone()
+        cur.close()
         return tuple(row) if row else None
 
 
-def mark_support_handled(
-        support_id: int,
-        admin_id: Optional[int] = None,
-        admin_reply: Optional[str] = None,
-) -> None:
-    """Отмечает обращение как обработанное."""
+def mark_support_handled(support_id: int, admin_id: int, admin_reply: Optional[str] = None) -> bool:
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE support_messages
-            SET handled = 1,
-                admin_id = ?,
-                admin_reply = ?
-            WHERE id = ?
-        """, (admin_id, admin_reply, support_id))
-        conn.commit()
-
-
-# ============================================================================
-# Cleanup Functions
-# ============================================================================
-def remove_expired_master_slots(cutoff_dt: Optional[datetime] = None) -> int:
-    """Удаляет просроченные слоты мастеров."""
-    now_local = (
-        datetime.now(LOCAL_TZ) if cutoff_dt is None else cutoff_dt.astimezone(LOCAL_TZ)
-    )
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, available_date, available_time FROM masters")
-        rows = cur.fetchall()
-
-        to_del = []
-        for r in rows:
-            try:
-                slot_naive = datetime.strptime(
-                    f"{r['available_date']} {r['available_time']}",
-                    "%Y-%m-%d %H:%M",
-                )
-                slot_local = slot_naive.replace(tzinfo=LOCAL_TZ)
-            except Exception:
-                to_del.append(r["id"])
-                continue
-
-            if slot_local < now_local:
-                to_del.append(r["id"])
-
-        if to_del:
-            placeholders = ",".join("?" for _ in to_del)
-            cur.execute(f"DELETE FROM masters WHERE id IN ({placeholders})", to_del)
-            conn.commit()
-            log.info("db: Удалено %d просроченных слотов", len(to_del))
-            return len(to_del)
-
-        return 0
-
-
-def remove_old_completed_bookings(days: int = 30) -> int:
-    """Удаляет старые завершённые записи."""
-    cutoff_dt = datetime.now(dt_timezone.utc) - timedelta(days=days)
-    cutoff_str = cutoff_dt.isoformat()
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            DELETE FROM bookings
-            WHERE completed = 1
-            AND datetime(completed_at) < datetime(?)
-        """, (cutoff_str,))
-        conn.commit()
-        deleted = cur.rowcount
-
-        if deleted > 0:
-            log.info(f"db: Удалено {deleted} старых завершённых записей (старше {days} дней)")
-
-        return deleted
-
-
-def remove_expired_bookings(grace_hours: int = 2) -> int:
-    """Удаляет просроченные неявки."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT id, date, time, duration_minutes, master
-            FROM bookings
-            WHERE completed = 0
-        """)
-        rows = cur.fetchall()
-
-        now_local = datetime.now(LOCAL_TZ)
-        to_delete = []
-
-        for r in rows:
-            try:
-                booking_naive = datetime.strptime(
-                    f"{r['date']} {r['time']}",
-                    "%Y-%m-%d %H:%M"
-                )
-                booking_local = booking_naive.replace(tzinfo=LOCAL_TZ)
-
-                duration = int(r['duration_minutes'] or 60)
-                end_time = booking_local + timedelta(minutes=duration, hours=grace_hours)
-
-                if end_time < now_local:
-                    to_delete.append(r['id'])
-                    log.info(
-                        f"db: Запись #{r['id']} просрочена и будет удалена "
-                        f"(дата: {r['date']} {r['time']})"
-                    )
-            except Exception:
-                log.exception(f"db: Ошибка обработки записи #{r['id']}")
-                continue
-
-        if to_delete:
-            placeholders = ",".join("?" for _ in to_delete)
-            cur.execute(
-                f"DELETE FROM bookings WHERE id IN ({placeholders})",
-                to_delete
-            )
-            conn.commit()
-            log.info(f"db: Удалено {len(to_delete)} просроченных записей (неявки)")
-            return len(to_delete)
-
-        return 0
-
-
-def cleanup_all_expired_data() -> Dict[str, int]:
-    """Комплексная очистка всех просроченных данных."""
-    stats = {
-        'expired_slots': 0,
-        'expired_bookings': 0,
-        'old_completed': 0,
-    }
-
-    stats['expired_slots'] = remove_expired_master_slots()
-    stats['expired_bookings'] = remove_expired_bookings(grace_hours=2)
-
-    try:
-        from config import OLD_BOOKINGS_RETENTION_DAYS
-        stats['old_completed'] = remove_old_completed_bookings(days=OLD_BOOKINGS_RETENTION_DAYS)
-    except ImportError:
-        stats['old_completed'] = remove_old_completed_bookings(days=90)
-
-    total = sum(stats.values())
-    if total > 0:
-        log.info(
-            f"db: Очистка завершена. Удалено: "
-            f"слотов={stats['expired_slots']}, "
-            f"неявок={stats['expired_bookings']}, "
-            f"старых записей={stats['old_completed']}"
+            SET handled=1, admin_id=?, admin_reply=?
+            WHERE id=?
+            """,
+            (int(admin_id), admin_reply, int(support_id)),
         )
+        ok = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        return ok
 
-    return stats
 
-
-# ============================================================================
-# Database Analytics
-# ============================================================================
+# -----------------------------------------------------------------------------
+# STATS / CLEANUP / VACUUM
+# -----------------------------------------------------------------------------
 def get_database_stats() -> Dict[str, int]:
-    """Получает статистику БД."""
     with get_conn() as conn:
         cur = conn.cursor()
-
-        stats = {}
-        stats["users"] = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        stats["masters_slots"] = cur.execute("SELECT COUNT(*) FROM masters").fetchone()[0]
-        stats["active_bookings"] = cur.execute(
-            "SELECT COUNT(*) FROM bookings WHERE completed = 0"
-        ).fetchone()[0]
-        stats["completed_bookings"] = cur.execute(
-            "SELECT COUNT(*) FROM bookings WHERE completed = 1"
-        ).fetchone()[0]
-        stats["pending_support"] = cur.execute(
-            "SELECT COUNT(*) FROM support_messages WHERE handled = 0"
-        ).fetchone()[0]
-
+        stats = {
+            "users": int(cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]),
+            "masters_slots": int(cur.execute("SELECT COUNT(*) FROM masters").fetchone()[0]),
+            "active_bookings": int(cur.execute("SELECT COUNT(*) FROM bookings WHERE completed=0").fetchone()[0]),
+            "completed_bookings": int(cur.execute("SELECT COUNT(*) FROM bookings WHERE completed=1").fetchone()[0]),
+            "pending_support": int(cur.execute("SELECT COUNT(*) FROM support_messages WHERE handled=0").fetchone()[0]),
+        }
+        cur.close()
         return stats
 
 
 def vacuum_database() -> None:
-    """Оптимизирует БД."""
     with get_conn() as conn:
         conn.execute("VACUUM")
         conn.commit()
-        log.info("db: VACUUM выполнен успешно")
 
 
-def remove_master_slots(slot_ids: List[int]) -> int:
-    """Удаляет слоты по ID."""
-    if not slot_ids:
+def _remove_expired_bookings_no_show() -> int:
+    now_utc = _utc_now()
+    removed = 0
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, date, time, duration_minutes
+            FROM bookings
+            WHERE completed=0
+            """
+        )
+        rows = cur.fetchall()
+
+        for r in rows:
+            try:
+                start_utc = _to_utc(_to_local_dt(r["date"], r["time"]))
+                end_utc = start_utc + timedelta(minutes=int(r["duration_minutes"] or 60))
+            except Exception:
+                continue
+
+            if end_utc + timedelta(hours=int(BOOKING_GRACE_HOURS)) < now_utc:
+                cur.execute("DELETE FROM bookings WHERE id=?", (int(r["id"]),))
+                removed += 1
+
+        conn.commit()
+        cur.close()
+
+    return removed
+
+
+def _remove_old_completed_bookings() -> int:
+    days = int(OLD_BOOKINGS_RETENTION_DAYS or 0)
+    if days <= 0:
         return 0
 
+    cutoff = _utc_now() - timedelta(days=days)
     with get_conn() as conn:
         cur = conn.cursor()
-        placeholders = ",".join("?" for _ in slot_ids)
-        cur.execute(f"DELETE FROM masters WHERE id IN ({placeholders})", slot_ids)
-        conn.commit()
+        cur.execute(
+            """
+            DELETE FROM bookings
+            WHERE completed=1 AND completed_at IS NOT NULL AND completed_at < ?
+            """,
+            (cutoff.isoformat(),),
+        )
         deleted = cur.rowcount
-
-        if deleted > 0:
-            log.info(f"db: Удалено {deleted} слотов по ID")
-
-        return deleted
-
-
-def remove_master_slots_by_name(master_name: str) -> int:
-    """Удаляет все слоты мастера по имени."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM masters WHERE name = ?", (master_name,))
         conn.commit()
-        deleted = cur.rowcount
-
-        if deleted > 0:
-            log.info(f"db: Удалено {deleted} слотов для мастера '{master_name}'")
-
-        return deleted
+        cur.close()
+        return int(deleted)
 
 
-# ============================================================================
-# Export
-# ============================================================================
-__all__ = [
-    "init_db",
-    "ensure_support_parent_column",
-    "add_user",
-    "get_user",
-    "update_master_schedule",
-    "get_all_master_slots",
-    "set_master_telegram",
-    "get_available_dates",
-    "get_available_times",
-    "get_available_masters",
-    "add_booking",
-    "check_booking",
-    "get_user_bookings",
-    "get_booking_by_id",
-    "cancel_booking",
-    "get_all_bookings_for_admin",
-    "get_all_bookings_due_between",
-    "mark_reminder_sent",
-    "get_bookings_ending_before",
-    "mark_booking_completed",
-    "get_completed_bookings",
-    "add_support_message",
-    "get_pending_supports",
-    "get_support_by_id",
-    "mark_support_handled",
-    "remove_expired_master_slots",
-    "remove_old_completed_bookings",
-    "remove_expired_bookings",
-    "cleanup_all_expired_data",
-    "get_database_stats",
-    "vacuum_database",
-]
+def cleanup_all_expired_data() -> Dict[str, int]:
+    expired_slots = remove_expired_master_slots()
+    expired_bookings = _remove_expired_bookings_no_show()
+    old_completed = _remove_old_completed_bookings()
+    return {
+        "expired_slots": int(expired_slots),
+        "expired_bookings": int(expired_bookings),
+        "old_completed": int(old_completed),
+    }
